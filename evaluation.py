@@ -1,4 +1,44 @@
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
 from dataset import extended_tofts
+
+import os
+import time
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from models import DCEModelFC, DCEModelCNN, DCEModelTransformer
+from dataset import SimulationDataset  # If needed
+from loss import mpae                # If needed
+
+from scipy.optimize import least_squares
+from scipy.stats import ttest_rel
+from utils import bland_altman_plot
+
+from numpy import ones, kron, mean, eye, hstack, dot, tile
+from numpy.linalg import pinv
+
+def generate_eval(args):
+    
+    # Instantiate the dataset. data_folder, num_samples, dce_dim, out_dim, dt, dist, max_params):
+    dataset = SimulationDataset(args.input_folder,args.val_size, args.length, args.out_dim, args.dt, args.sim_dist,[args.max_vp,args.max_ktrans,args.max_ve,args.max_kep])
+    
+    tissues = []
+    aifs = []
+    kvs = []
+    for i in range(len(dataset)):
+        tissue, aif, kv = dataset[i]
+        tissues.append(tissue)
+        aifs.append(aif)
+        kvs.append(kv)
+    
+    tissues = np.array(tissues)  # shape: (num_samples, dce_dim)
+    aifs = np.array(aifs)        # shape: (num_samples, dce_dim)
+    kvs = np.array(kvs)          # shape: (num_samples, 4)
+    
+    # Save the generated data.
+    np.savez(args.eval_data, tissue=tissues, aif=aifs, kv=kvs)
+    print(f"Saved test_data.npz with {args.val_size} samples.")
+    
 def fit_pred_ls(c_pl_pred, c_pan_pred, dt=None): 
     numel = len(c_pan_pred)
     
@@ -33,7 +73,7 @@ def fit_pred_ls(c_pl_pred, c_pan_pred, dt=None):
         fit_time_v.append(time.time() - timenow)
         residual_v.append(residual)
 
-        if ind % 100 == 0: 
+        if ind % 20 == 0: 
             print(f"Finished fitting for prediction index: {ind}")
 
     # Convert the lists to NumPy arrays
@@ -47,317 +87,259 @@ def fit_pred_ls(c_pl_pred, c_pan_pred, dt=None):
     # Return the five variables separately
     return vp_v,ktr_v,  ve_v, kep_v, fit_time_v, residual_v
 
-import os
-import glob
-import time
-import numpy as np
-import scipy.io as sio
-import matplotlib.pyplot as plt
-from scipy.stats import ttest_ind
+def significance_stars(p):
+    """Return significance stars based on p-value."""
+    if p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    else:
+        return "n.s."
 
-def evaluate(
-    pretrained_folder,
-    varpro_folder=None,
-    nlls_folder=None,
-    gt_folder=None,
-    dt=1.0,
-    save_fig_path="evaluation_results.png"
-):
+def compute_nrmse_curve(gt_curve, fitted_curve):
     """
-    Evaluate NRMSE and fitting time for the pre-trained model (and optionally
-    VARPRO and NLLS) against ground truth, then plot and mark significance levels.
-
-    Parameters
-    ----------
-    pretrained_folder : str
-        Path to folder containing .mat files with predictions from the pre-trained model.
-    varpro_folder : str, optional
-        Path to folder containing .mat files with VARPRO predictions.
-    nlls_folder : str, optional
-        Path to folder containing .mat files with NLLS predictions.
-    gt_folder : str, optional
-        Path to folder containing ground truth .mat files, or it could be the same .mat
-        files that also contain ground truth tissue curves.
-    dt : float, optional
-        Time spacing (used if you want to re-fit or do additional computations).
-    save_fig_path : str, optional
-        Where to save the final evaluation figure.
-
-    Returns
-    -------
-    None
-        Plots and saves a figure showing boxplots of NRMSE and bar plots of inference/fitting time,
-        with significance levels indicated.
-
-    Notes
-    -----
-    - This is a skeleton function; adapt data loading, curve extraction, and time measurements
-      to your specific use case.
-    - If you already have arrays of NRMSE/time for each method, you can skip the .mat loading
-      and simply do the plotting and significance testing.
+    Compute the NRMSE between two 1D curves.
+    NRMSE = sqrt(mean((gt - fitted)^2)) / mean(gt)
     """
+    eps = 1e-8
+    return np.sqrt(np.mean((gt_curve - fitted_curve)**2)) / (np.mean(gt_curve) + eps)
 
-    # Helper function to compute NRMSE
-    def compute_nrmse(gt_curve, pred_curve):
-        """
-        Compute Normalized Root Mean Square Error:
-        sqrt(mean((gt - pred)^2)) / mean(gt)
-        """
-        gt_curve = np.asarray(gt_curve, dtype=np.float32)
-        pred_curve = np.asarray(pred_curve, dtype=np.float32)
-        if np.mean(gt_curve) < 1e-8:
-            return 0.0  # Avoid division by zero if ground truth is near 0
-        return np.sqrt(np.mean((gt_curve - pred_curve)**2)) / np.mean(gt_curve)
+    
 
-    # Optionally, a helper to label significance stars
-    def significance_stars(p):
-        if p < 0.001:
-            return "***"
-        elif p < 0.01:
-            return "**"
-        elif p < 0.05:
-            return "*"
-        else:
-            return "n.s."
+def evaluate(args):
+    """
+    Evaluate the pre-trained model by comparing the fitted curve (via two routes)
+    to the original tissue curve. In particular, for each sample:
+      - Compute a fitted curve using the predicted parameters.
+      - Refine these parameters via a least-squares fit.
+      - Compute the NRMSE between the fitted curve and the original tissue curve.
+      - Measure the time needed for the least-squares fitting.
+      
+    Also, a Bland–Altman plot (using bland_altman_plot) is produced on a scalar summary 
+    (here, AUC) of the original tissue vs. the refined fitted curves.
+    
+    The results (NRMSE and fitting time) are compared between:
+      - "Prediction" (direct from NN; fitting time is nearly zero)
+      - "Refined Fitting" (after LS refinement)
+      
+    Significance levels (p-values) from paired t-tests are annotated on the plots.
+    """
+    # ------------------- 1. Load evaluation data -------------------
+    data = np.load(args.eval_data)
 
-    # Prepare lists to store NRMSEs and times for each method
-    nrmse_pretrained = []
-    nrmse_varpro    = []
-    nrmse_nlls      = []
+    tissues = data['tissue']  # shape: (num_samples, length)
+    aifs = data['aif']        # shape: (num_samples, length)
+    kvs = data['kv']          # ground-truth kinetic parameters; not used directly here
+    num_samples = len(tissues)
+    print(f"[INFO] Loaded {num_samples} samples from {args.eval_data}.")
 
-    time_pretrained = []
-    time_varpro     = []
-    time_nlls       = []
+    # ------------------- 2. Load the pre-trained model -------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
 
-    # ----------------------------------------------------------------------------
-    # (1) Load predictions and ground truth for Pre-trained model
-    # ----------------------------------------------------------------------------
-    if pretrained_folder is not None:
-        pretrained_files = glob.glob(os.path.join(pretrained_folder, '*.mat'))
-        for mat_path in pretrained_files:
-            mat_data = sio.loadmat(mat_path)
-            # Example: if 'predictions' key holds the model predictions
-            # If each .mat has shape (#_pixels, #_params) or (#_pixels, #_timepoints), adapt accordingly.
-            if 'predictions' not in mat_data:
-                continue
+    if args.model == "FC":
+        model = DCEModelFC(in_dim=args.length, out_dim=args.out_dim, layer_num=args.layer_num).to(device)
+    elif args.model == "CNN":
+        model = DCEModelCNN(dce_dim=args.length, out_dim=args.out_dim).to(device)
+    elif args.model == "Transformer":
+        model = DCEModelTransformer(dce_dim=args.length, out_dim=args.out_dim, num_layers=args.layer_num).to(device)
+    else:
+        raise ValueError(f"Unknown Model Type '{args.model}'. Try FC, CNN, or Transformer.")
 
-            # Load predicted curves or parameters
-            pred = mat_data['predictions']
+    if args.model_path is None or not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {args.model_path}")
+    checkpoint = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(checkpoint)
+    model.eval()
 
-            # Load ground truth from the same or separate .mat file
-            # In many setups, ground truth might be in the same file, or you might
-            # look up a file with the same base name in gt_folder.
-            # Here is an example if ground truth is also in mat_data:
-            if gt_folder is not None:
-                base_name = os.path.basename(mat_path)
-                gt_path = os.path.join(gt_folder, base_name)
-                if os.path.exists(gt_path):
-                    gt_data = sio.loadmat(gt_path)
-                    # Suppose ground-truth tissue curve is "c_tissue_gt"
-                    # and you want to compare them with the predicted curve "pred".
-                    # In practice, adapt to your actual naming and shapes.
-                    if 'c_tissue_gt' in gt_data:
-                        c_tissue_gt = gt_data['c_tissue_gt']
-                        # Example: compute NRMSE across all pixels
-                        # If shape mismatch, adapt accordingly
-                        for i in range(len(c_tissue_gt)):
-                            # Just a demonstration. Adjust to match your data shape:
-                            c_gt = c_tissue_gt[i]
-                            c_pd = pred[i]
-                            # Compute NRMSE
-                            nrmse_val = compute_nrmse(c_gt, c_pd)
-                            nrmse_pretrained.append(nrmse_val)
-            else:
-                # Or skip if ground truth is in the same file:
-                if 'c_tissue_gt' in mat_data:
-                    c_tissue_gt = mat_data['c_tissue_gt']
-                    for i in range(len(c_tissue_gt)):
-                        nrmse_val = compute_nrmse(c_tissue_gt[i], pred[i])
-                        nrmse_pretrained.append(nrmse_val)
+    # ------------------- 3. Run inference to obtain predicted parameters -------------------
+    batch_size = args.batch_size
+    all_preds = []
+    start_time = time.time()
+    with torch.no_grad():
+        for start_idx in range(0, num_samples, batch_size):
+            end_idx = min(start_idx + batch_size, num_samples)
+            tissue_batch = torch.tensor(tissues[start_idx:end_idx], dtype=torch.float32).to(device)
+            aif_batch    = torch.tensor(aifs[start_idx:end_idx], dtype=torch.float32).to(device)
+            pred_params = model(tissue_batch, aif_batch)  # Expected shape: (batch, 4) [vp, ktrans, ve, kep]
+            all_preds.append(pred_params.cpu().numpy())
+    inference_time = time.time() - start_time
+    preds = np.concatenate(all_preds, axis=0)
+    print(f"[INFO] Inference completed on {num_samples} samples in {inference_time:.2f} sec.")
 
-            # Measure or retrieve inference time (if recorded separately)
-            # For example, if your code logs time in mat_data['inference_time'] or
-            # if you measure it externally, adapt accordingly:
-            if 'inference_time' in mat_data:
-                time_pretrained.append(float(mat_data['inference_time'].squeeze()))
-            else:
-                # Otherwise, do a placeholder or measure externally
-                pass
+    # ------------------- 4. For each sample, compute errors and fitting time -------------------
+    # We compare two approaches:
+    # (a) "Prediction": directly compute fitted curve from predicted parameters.
+    # (b) "Refined Fitting": run a least-squares fit (using predicted parameters as initial guess)
+    #      to refine the parameters and compute the fitted curve.
+    errors_pred = []
+    errors_refined = []
+    time_pred = []      # Will be zeros (no iterative fitting)
+    time_refined = []   # Fitting times from least squares
 
-    # ----------------------------------------------------------------------------
-    # (2) Load results for VARPRO
-    # ----------------------------------------------------------------------------
-    if varpro_folder is not None:
-        varpro_files = glob.glob(os.path.join(varpro_folder, '*.mat'))
-        for mat_path in varpro_files:
-            mat_data = sio.loadmat(mat_path)
-            if 'predictions' not in mat_data:
-                continue
+    # For Bland–Altman, compute a scalar summary (e.g., area under curve, AUC)
+    auc_original = []
+    auc_refined = []
 
-            pred = mat_data['predictions']
-            # Suppose you do the same approach for ground truth
-            # ...
-            # Example skeleton:
-            if gt_folder is not None:
-                base_name = os.path.basename(mat_path)
-                gt_path = os.path.join(gt_folder, base_name)
-                if os.path.exists(gt_path):
-                    gt_data = sio.loadmat(gt_path)
-                    if 'c_tissue_gt' in gt_data:
-                        c_tissue_gt = gt_data['c_tissue_gt']
-                        for i in range(len(c_tissue_gt)):
-                            nrmse_val = compute_nrmse(c_tissue_gt[i], pred[i])
-                            nrmse_varpro.append(nrmse_val)
-            if 'fitting_time' in mat_data:
-                time_varpro.append(float(mat_data['fitting_time'].squeeze()))
+    # Loop over each sample (this may be slow if num_samples is very large)
+    # for i in range(num_samples):
+    vp_nlls = []
+    ktrans_nlls=[]
+    kep_nlls=[]
+    ve_nlls=[]
 
-    # ----------------------------------------------------------------------------
-    # (3) Load results for NLLS
-    # ----------------------------------------------------------------------------
-    if nlls_folder is not None:
-        nlls_files = glob.glob(os.path.join(nlls_folder, '*.mat'))
-        for mat_path in nlls_files:
-            mat_data = sio.loadmat(mat_path)
-            if 'predictions' not in mat_data:
-                continue
+    vp_gt =  kvs[:args.val_size,0]
+    ktrans_gt=kvs[:args.val_size,1]
+    kep_gt=kvs[:args.val_size,2]
+    ve_gt=kvs[:args.val_size,3]
 
-            pred = mat_data['predictions']
-            # Suppose you do the same approach for ground truth
-            # ...
-            if gt_folder is not None:
-                base_name = os.path.basename(mat_path)
-                gt_path = os.path.join(gt_folder, base_name)
-                if os.path.exists(gt_path):
-                    gt_data = sio.loadmat(gt_path)
-                    if 'c_tissue_gt' in gt_data:
-                        c_tissue_gt = gt_data['c_tissue_gt']
-                        for i in range(len(c_tissue_gt)):
-                            nrmse_val = compute_nrmse(c_tissue_gt[i], pred[i])
-                            nrmse_nlls.append(nrmse_val)
-            if 'fitting_time' in mat_data:
-                time_nlls.append(float(mat_data['fitting_time'].squeeze()))
+    vp_pred =[]
+    ktrans_pred=[]
+    kep_pred=[]
+    ve_pred=[]
+    for i in range(args.val_size): # use val_size instead of whole validation set 
+        aif = aifs[i]       # 1D array of length args.length
+        tissue = tissues[i] # Original tissue curve
+        
+        # --- (a) Direct prediction ---
+        # Use predicted parameters: order [vp, ktrans, ve, kep]
+        pred_params = preds[i]
+        pred_vp, pred_ktrans, pred_ve, pred_kep = pred_params
+        # Note: extended_tofts uses [aif, vp, ktrans, kep, dt]; ve is computed internally.
+        fitted_curve_pred = extended_tofts(aif, pred_vp, pred_ktrans, pred_kep, args.dt)
+        err_pred = compute_nrmse_curve(tissue, fitted_curve_pred)
+        errors_pred.append(err_pred)
+        time_pred.append(0.0)  # No iterative fitting time
 
-    # Convert to numpy arrays for convenience
-    nrmse_pretrained = np.array(nrmse_pretrained)
-    nrmse_varpro     = np.array(nrmse_varpro)
-    nrmse_nlls       = np.array(nrmse_nlls)
+        # --- (b) Refined fitting via least-squares ---
+        # Use predicted values for vp, ktrans, and kep as the initial guess.
+        # (Assume that ve is computed as ktrans/kep.)
+        # x0 = [pred_vp, pred_ktrans, pred_kep]
+        x0=[0.1,0.1,0.1] #[vp, ktrans, ve, kep]fit first three
+        # Define the residual function: difference between model (fitted curve) and tissue curve.
+        def fun_to_fit(x):
+            # x: [vp, ktrans, kep]
+            return extended_tofts(aif, x[0], x[1], x[1]/x[2], args.dt) - tissue
 
-    time_pretrained = np.array(time_pretrained) if len(time_pretrained) else np.array([1])  # fallback
-    time_varpro     = np.array(time_varpro)     if len(time_varpro) else np.array([10])    # fallback
-    time_nlls       = np.array(time_nlls)       if len(time_nlls) else np.array([100])     # fallback
+        t0 = time.time()
+        res = least_squares(fun_to_fit, x0, bounds=([1e-4, 1e-6, 0.1], [0.8, 0.2, 0.8]))
+        fit_time = time.time() - t0
+        time_refined.append(fit_time)
 
-    # ----------------------------------------------------------------------------
-    # (4) Plot NRMSE (box plot) and fitting time (bar plot)
-    # ----------------------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        x_opt = res.x
+        refined_vp = x_opt[0]
+        refined_ktrans = x_opt[1]
+        refined_ve = x_opt[2]
+        refined_kep = refined_ktrans / refined_ve  # Consistent with prior code
+        # Compute the refined fitted curve.
+        fitted_curve_refined = extended_tofts(aif, refined_vp, refined_ktrans, refined_kep, args.dt)
+        err_refined = compute_nrmse_curve(tissue, fitted_curve_refined)
+        errors_refined.append(err_refined)
 
-    # Left: Box plot for NRMSE
-    data_for_box = []
-    labels_for_box = []
-    if len(nrmse_pretrained):
-        data_for_box.append(nrmse_pretrained)
-        labels_for_box.append("Pre-trained")
-    if len(nrmse_varpro):
-        data_for_box.append(nrmse_varpro)
-        labels_for_box.append("VARPRO")
-    if len(nrmse_nlls):
-        data_for_box.append(nrmse_nlls)
-        labels_for_box.append("NLLS")
+        # Compute AUC (area under curve) for Bland–Altman plot.
+        auc_original.append(np.trapz(tissue))
+        auc_refined.append(np.trapz(fitted_curve_refined))
 
-    box = axes[0].boxplot(data_for_box, patch_artist=True, labels=labels_for_box)
+        vp_nlls.append(refined_vp)
+        ktrans_nlls.append(refined_ktrans)
+        kep_nlls.append(refined_kep)
+        ve_nlls.append(refined_ve)
+
+        vp_pred.append(pred_vp)
+        ktrans_pred.append(pred_ktrans)
+        ve_pred.append(pred_ve)
+        kep_pred.append(pred_kep)
+
+    errors_pred = np.array(errors_pred)
+    errors_refined = np.array(errors_refined)
+    time_pred = np.array(time_pred)
+    time_refined = np.array(time_refined)
+    auc_original = np.array(auc_original)
+    auc_refined = np.array(auc_refined)
+
+    vp_nlls=np.array(vp_nlls)
+    ktrans_nlls=np.array(ktrans_nlls)
+    kep_nlls=np.array(kep_nlls)
+    ve_nlls=np.array(ve_nlls)
+
+    vp_pred=np.array(vp_pred)
+    ktrans_pred=np.array(ktrans_pred)
+    ve_pred=np.array(ve_pred)
+    kep_pred=np.array(kep_pred)
+    # ------------------- 5. Statistical tests -------------------
+    # Paired t-test on NRMSE (Prediction vs. Refined Fitting)
+    t_err, p_err = ttest_rel(errors_pred, errors_refined)
+    # Paired t-test on fitting time (Prediction vs. Refined Fitting)
+    t_time, p_time = ttest_rel(time_pred, time_refined)
+
+    print(f"[RESULT] Mean NRMSE (Prediction)  = {np.mean(errors_pred):.4f}")
+    print(f"[RESULT] Mean NRMSE (Refined)     = {np.mean(errors_refined):.4f} (p = {p_err:.3e})")
+    print(f"[RESULT] Mean fitting time (Refined) = {np.mean(time_refined):.4f} sec (p = {p_time:.3e})")
+
+    # ------------------- 6. Plotting -------------------
+    fig, axes = plt.subplots(1,2, figsize=(9, 5))
+
+    # (a) Box plot: NRMSE for Prediction vs. Refined Fitting.
+    bp = axes[0].boxplot([errors_pred, errors_refined], patch_artist=True, labels=["Prediction", "Refined"])
     axes[0].set_ylabel("NRMSE")
-
-    # Optionally mark the mean with an 'X'
-    for median in box['medians']:
+    axes[0].set_title("Fitted Curve NRMSE")
+    for median in bp['medians']:
         median.set(color='black', linewidth=1.5)
-    for mean_idx, dataset in enumerate(data_for_box, start=1):
-        mean_val = np.mean(dataset)
-        axes[0].plot(mean_idx, mean_val, 'x', color='white', markersize=10, markeredgewidth=2)
+    # Annotate significance between groups:
+    def annotate_significance(ax, x1, x2, y, p_val):
+        ax.plot([x1, x1, x2, x2], [y, y*1.05, y*1.05, y], color='k', linewidth=1.2)
+        ax.text((x1+x2)*0.5, y*1.07, significance_stars(p_val), ha='center', va='bottom', color='k')
+    y_max_err = max(np.max(errors_pred), np.max(errors_refined))
+    annotate_significance(axes[0], 1, 2, y_max_err * 1.1, p_err)
 
-    # Right: Bar plot of average time (on log scale, if desired)
-    mean_times = []
-    bar_labels = []
-    if len(time_pretrained):
-        mean_times.append(np.mean(time_pretrained))
-        bar_labels.append("Pre-trained")
-    if len(time_varpro):
-        mean_times.append(np.mean(time_varpro))
-        bar_labels.append("VARPRO")
-    if len(time_nlls):
-        mean_times.append(np.mean(time_nlls))
-        bar_labels.append("NLLS")
 
-    axes[1].bar(bar_labels, mean_times)
-    axes[1].set_yscale("log")  # comment this out if you prefer linear scale
-    axes[1].set_ylabel("Fitting/Inference Time (s)")
 
-    # ----------------------------------------------------------------------------
-    # (5) Mark significance among methods (pairwise)
-    # ----------------------------------------------------------------------------
-    # If you only have two methods, just do a single test. For three, do pairwise.
-    # Example: do t-tests for each pair
-    if len(data_for_box) >= 2:
-        # Indices: 0 -> Pre-trained, 1 -> VARPRO, 2 -> NLLS
-        # Do pairwise significance
-        # We only demonstrate if each group has data:
-        x_positions = np.arange(1, len(data_for_box) + 1)
-
-        # A simple function to place significance text above the boxes
-        def annotate_significance(ax, x1, x2, y, p_val):
-            """
-            Draw a bracket and place significance text between boxes at x1 and x2.
-            """
-            ax.plot([x1, x1, x2, x2], [y, y+0.001, y+0.001, y], color='k', linewidth=1.2)
-            ax.text((x1+x2)*0.5, y+0.002, significance_stars(p_val), ha='center', va='bottom', color='k')
-
-        # We'll place each significance bracket slightly above the max NRMSE
-        y_max = max(np.concatenate(data_for_box))
-        height_step = 0.005 * y_max  # spacing for each bracket
-
-        current_height = y_max + height_step
-
-        # Example pairwise comparisons:
-        if len(data_for_box) == 3:
-            # Pre-trained vs VARPRO
-            p_12 = ttest_ind(data_for_box[0], data_for_box[1], equal_var=False).pvalue
-            annotate_significance(axes[0], 1, 2, current_height, p_12)
-            current_height += height_step
-
-            # Pre-trained vs NLLS
-            p_13 = ttest_ind(data_for_box[0], data_for_box[2], equal_var=False).pvalue
-            annotate_significance(axes[0], 1, 3, current_height, p_13)
-            current_height += height_step
-
-            # VARPRO vs NLLS
-            p_23 = ttest_ind(data_for_box[1], data_for_box[2], equal_var=False).pvalue
-            annotate_significance(axes[0], 2, 3, current_height, p_23)
-            current_height += height_step
-
-        elif len(data_for_box) == 2:
-            # Just compare data_for_box[0] and data_for_box[1]
-            p_12 = ttest_ind(data_for_box[0], data_for_box[1], equal_var=False).pvalue
-            annotate_significance(axes[0], 1, 2, current_height, p_12)
-
+    # (c) Bar plot: Fitting time for Prediction (0) vs. Refined Fitting.
+    mean_time_pred = np.mean(time_pred)
+    mean_time_refined = np.mean(time_refined)
+    axes[1].bar(["Prediction", "Refined"], [mean_time_pred, mean_time_refined])
+    axes[1].set_yscale("log")
+    axes[1].set_ylabel("Fitting Time (sec)")
+    axes[1].set_title("Average Fitting Time")
+    y_max_time = max(mean_time_pred, mean_time_refined)
+    annotate_significance(axes[1], 1, 2, y_max_time * 1.1, p_time)
+        
     plt.tight_layout()
-    plt.savefig(save_fig_path, dpi=200)
+    # Save the figure in the directory specified by args.eval_result
+    os.makedirs(args.eval_result, exist_ok=True)
+    fig_path = os.path.join(args.eval_result, "evaluation_results.png")
+    plt.savefig(fig_path, dpi=200)
     plt.show()
 
-    print(f"Evaluation figure saved to: {save_fig_path}")
-    print("Done.")
+    fig, axes = plt.subplots(1,4, figsize=(18, 5))
+    bland_altman_plot(axes[0], vp_gt, vp_pred, "Bland–Altman vp: params (Original vs. pred)")
+    bland_altman_plot(axes[1], ktrans_gt, ktrans_pred, "Bland–Altman ktrans: params (Original vs. pred)")
+    bland_altman_plot(axes[2], ve_gt, ve_pred, "Bland–Altman ve: params (Original vs. pred)")
+    bland_altman_plot(axes[3], kep_gt, kep_pred, "Bland–Altman kep: params (Original vs. pred)")
+    plt.tight_layout()
+    fig_path = os.path.join(args.eval_result, "bland_altman_results_pred.png")
+    plt.savefig(fig_path, dpi=200)
+    plt.show()
 
+    fig, axes = plt.subplots(1,4, figsize=(18, 5))
+    bland_altman_plot(axes[0], vp_gt, vp_nlls, "Bland–Altman vp: params (Original vs. nlls)")
+    bland_altman_plot(axes[1], ktrans_gt, ktrans_nlls, "Bland–Altman ktrans: params (Original vs. nlls)")
+    bland_altman_plot(axes[2], ve_gt, ve_nlls, "Bland–Altman ve: params (Original vs. nlls)")
+    bland_altman_plot(axes[3], kep_gt, kep_nlls, "Bland–Altman kep: params (Original vs. nlls)")
+    plt.tight_layout()
+    fig_path = os.path.join(args.eval_result, "bland_altman_results_nlls.png")
+    plt.savefig(fig_path, dpi=200)
+    plt.show()
 
-# -----------------------------------------------------------------------------
-# USAGE EXAMPLE (pseudocode)
-# -----------------------------------------------------------------------------
+    
+    print(f"[INFO] Evaluation figure saved to {fig_path}")
+    print("[INFO] Evaluation complete.")
+
+# Example usage:
 # if __name__ == "__main__":
-#     # Suppose you have run your inference for each method and saved .mat results
-#     # to separate folders: 'pretrained_out', 'varpro_out', 'nlls_out'.
-#     # And your ground-truth curves are in 'gt_folder'.
-#     evaluate(
-#         pretrained_folder="path/to/pretrained_out",
-#         varpro_folder="path/to/varpro_out",
-#         nlls_folder="path/to/nlls_out",
-#         gt_folder="path/to/gt_folder",
-#         dt=1.0,
-#         save_fig_path="evaluation_results.png"
-#     )
+#     args = parse_args()
+#     if args.mode == "evaluate":
+#         evaluate(args)
+

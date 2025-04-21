@@ -1,6 +1,8 @@
 import argparse
 from train import train
 from inference import infer,run_inference
+from evaluation import evaluate
+from evaluation import generate_eval
 import torch
 # =============================================================================
 # Command-line arguments
@@ -28,7 +30,7 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=0.998, help="Alpha weight for MixedLoss")
     parser.add_argument("--checkpoint_dir", type=str, default="/hdd1/chaowei/checkpoints", help="Directory for saving checkpoints")
     parser.add_argument("--prefix", type=str, default="Simulation_Fitting", help="Prefix for log/checkpoint names")
-    parser.add_argument("--eval_data", type=str, default="/hdd1/chaowei/test_data.npz", help="Where is the eval data")
+    parser.add_argument("--eval_data", type=str, default="/hdd1/chaowei/test_new.npz", help="Where is the eval data")
     parser.add_argument("--eval_result", type=str, default="./artifacts", help="Where is the eval result saved")
     # Inference options
     parser.add_argument("--infer", action="store_true", help="Run inference on .mat files after training")
@@ -38,6 +40,7 @@ def parse_args():
     parser.add_argument("--infer_batch", type=int, default=32, help="Batch size for inference")
     parser.add_argument("--LDAIF", type=str, default='individual', help="common AIF or individual AIF for LD data")
     parser.add_argument("--subject_mean", type=str, default='parameter', help="subject-wise parameter or curve")
+    parser.add_argument("--bias_corr", type=bool, default='False', help="bias correction")
 
     
     return parser.parse_args()
@@ -51,5 +54,7 @@ if __name__ == "__main__":
         generate_eval(args)
     elif args.mode=='infer':
         infer(args)
+    elif args.mode == "evaluate":
+        evaluate(args)
     else:
         train(args)

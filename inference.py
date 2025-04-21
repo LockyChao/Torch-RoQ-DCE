@@ -26,9 +26,11 @@ def infer(args):
         raise "Unknown Model Type. Try FC, CNN, or Transformer."
     checkpoint = torch.load(args.model_path, weights_only=False)  # Ensure it's not just weights_only=True
     model.load_state_dict(checkpoint) 
-    run_inference(model,device,args.input_folder,args.output_folder,args.length,args.batch_size,args.dt, args.LDAIF,args.subject_mean)
+    run_inference(model,device,args.input_folder,\
+                  args.output_folder,args.length,args.batch_size,args.dt, \
+                  args.LDAIF,args.subject_mean,args.bias_corr)
     
-def run_inference(model, device, input_folder, output_folder, length, batch_size,dt, LDAIF='individual',subject_mean = 'parameter'): # common or individual? parameter or curve?
+def run_inference(model, device, input_folder, output_folder, length, batch_size,dt, LDAIF='individual',subject_mean = 'parameter',bias_corr=False): # common or individual? parameter or curve?
     model.eval()
     os.makedirs(output_folder, exist_ok=True)
     mat_files = glob.glob(os.path.join(input_folder, '*.mat'))
@@ -37,25 +39,64 @@ def run_inference(model, device, input_folder, output_folder, length, batch_size
     for mat_path in mat_files:
         mat_data = sio.loadmat(mat_path)
         base_name = os.path.basename(mat_path)
-
-        if LDAIF == 'common' and base_name.endswith('LD2.mat'):
+        """
+        pre-contrast bias correction 
+        """
+        if bias_corr and (base_name.endswith('LD2.mat') or base_name.endswith('SD.mat')):
             # Construct corresponding LD1 file name.
             ld1_name = base_name.replace('LD2.mat', 'LD1.mat')
             ld1_path = os.path.join(input_folder, ld1_name)
             if os.path.exists(ld1_path):
                 print(f"For {base_name}, using AIF from {ld1_name}.")
                 ld1_data = sio.loadmat(ld1_path)
-                c_bd = ld1_data['c_bd'].flatten().astype(np.float32)
+                r1_artery_ld1 = ld1_data['fits_T1_artery'].astype(np.float32)
+                n_dce = r1_artery_ld1.shape[-1]-3
+                r1_artery_ld1=np.mean(r1_artery_ld1[:,1:n_dce+1],axis=0)
+                r1_artery_ld1_0 = np.mean(r1_artery_ld1[:20])
+
+                r1_pan_ld1 = ld1_data['fits_T1_nontumor'].astype(np.float32)
+                r1_pan_ld1_0 = np.mean(r1_pan_ld1[:,:20])
+
+                r1_pan_now = mat_data['fits_T1_nontumor'].astype(np.float32)[:,1:n_dce+1]
+                r1_artery_now = mat_data['fits_T1_artery'].astype(np.float32)[:,1:n_dce+1]
+                r1_artery_now=np.mean(r1_artery_now,axis=0)
+                
+                c_bd = (r1_artery_now-r1_artery_ld1_0)/(1-0.4)/3.2
+                c_bd = c_bd[34:34+196]
+
+                c_all = (r1_pan_now-r1_pan_ld1_0)/3.2
+                c_all = c_all[34:34+196]
             else:
                 print(f"Warning: {ld1_name} not found; using current file's AIF.")
                 mat_data = sio.loadmat(mat_path)
                 c_bd = mat_data['c_bd'].flatten().astype(np.float32)
+
+
         else:
-            mat_data = sio.loadmat(mat_path)
+            
             c_bd = mat_data['c_bd'].flatten().astype(np.float32)
-        if subject_mean == 'parameter':
             c_all = mat_data['c_all'][:,:-10].astype(np.float32)  # shape (num_pixels, temporal_length)
             c_all[c_all<0]=0
+        ##############################
+        
+        # if LDAIF == 'common' and base_name.endswith('LD2.mat'):
+        #     # Construct corresponding LD1 file name.
+        #     ld1_name = base_name.replace('LD2.mat', 'LD1.mat')
+        #     ld1_path = os.path.join(input_folder, ld1_name)
+        #     if os.path.exists(ld1_path):
+        #         print(f"For {base_name}, using AIF from {ld1_name}.")
+        #         ld1_data = sio.loadmat(ld1_path)
+        #         c_bd = ld1_data['c_bd'].flatten().astype(np.float32)
+        #     else:
+        #         print(f"Warning: {ld1_name} not found; using current file's AIF.")
+        #         mat_data = sio.loadmat(mat_path)
+        #         c_bd = mat_data['c_bd'].flatten().astype(np.float32)
+        # else:
+        #     mat_data = sio.loadmat(mat_path)
+        #     c_bd = mat_data['c_bd'].flatten().astype(np.float32)
+        
+        if subject_mean == 'parameter':
+
             # For demonstration, mimic curve extraction
             # (here we simply crop or pad each row to desired length)
             def extrapolate_to_length(data, target_length):
@@ -119,8 +160,7 @@ def run_inference(model, device, input_folder, output_folder, length, batch_size
             plt.savefig(out_fig2)
             plt.show()
         else:
-            c_all = mat_data['c_all'][:,:-10].astype(np.float32)  # shape (num_pixels, temporal_length)
-            c_all[c_all<0]=0
+
             c_all = np.mean(c_all,axis=0,keepdims=True)
             # For demonstration, mimic curve extraction
             # (here we simply crop or pad each row to desired length)
@@ -131,6 +171,7 @@ def run_inference(model, device, input_folder, output_folder, length, batch_size
                 return data[:target_length]
             c_bd_extrap = extrapolate_to_length(c_bd, length)
             curves = np.array([extrapolate_to_length(row, length) for row in c_all])
+            print(curves.shape)
             predictions = []
             # Process in batches
             num_samples = curves.shape[0]

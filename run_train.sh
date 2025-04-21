@@ -1,0 +1,1 @@
+python main.py --mode train --model FC --batch_size 256 --lr 1e-4 --sim_dist normal --input_folder "/mnt/LiDXXLab_Files/Chaowei/Low-dose-Study/AI_Fitting/Input_extTofts_fitkep_wholePan/" --output_folder "./output_mat/Output_extTofts_fitkep_wholePan/" 
